@@ -35,5 +35,6 @@ make # make avx/neon
 ```
 
 ## TODO
+- DeepEmbed/DeepEmbedAttention
 - FP16 support, mainly on ARM NEON
 - Model quantization
