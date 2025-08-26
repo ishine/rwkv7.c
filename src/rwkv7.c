@@ -406,23 +406,36 @@ void time_mixing(float *dx, const float *x, float *v0, float *last_x, float *sta
     memcpy(last_x, x, sizeof(float) * c->n_embd);
 }
 
-void channel_mixing(float *dx, const float *x, float *last_x, block_weights *bw, rwkv_config *c) {
+void channel_mixing(float *dx, const float *x, float *last_x, const float *s_emb_x_T, block_weights *bw, rwkv_config *c) {
     float k[c->n_embd * 4];
     float xk[c->n_embd];
     LERP(xk, x, last_x, bw->ffn_x_k);
+
     MATxVEC(k, xk, bw->ffn_key_weight);
+    for (int i = 0; i < ARRLEN(k); i++) { k[i] = SQUARE(RELU(k[i])); }
+    
+    if (c->de) {
+        float s[c->n_embd * 4];
+        float ss[c->s_lora_r], ss_[c->s_lora_r];
+        mat_mul_vec(ss, x, bw->ffn_s1_T, c->n_embd, c->s_lora_r);
+        MATxVEC(ss_, ss, s_emb_x_T);
+        MATxVEC(s, ss_, bw->ffn_s2_T);
+        VECADD(s, s, bw->ffn_s0);
+        HADAMARD(k, k, s);
+    }
 
     float v[c->n_embd];
-    for (int i = 0; i < ARRLEN(k); i++) { k[i] = SQUARE(RELU(k[i])); }
     MATxVEC(v, k, bw->ffn_value_weight);
+    
     memcpy(dx, v, sizeof(float) * c->n_embd);
     memcpy(last_x, x, sizeof(float) * c->n_embd);
 }
 
 void forward(float *logits, rwkv_config *c, rwkv_weights *w, float *model_state[], int token) {
-    float x[c->n_embd];
-    memcpy(x, w->emb_weight + token * c->n_embd, sizeof(float) *ARRLEN(x));
+    float x[c->n_embd], _x[c->n_embd];
+    memcpy(x, w->emb_weight + token * c->n_embd, sizeof(float) * ARRLEN(x));
     layer_norm(x, x, w->blocks_0_ln0_weight, w->blocks_0_ln0_bias, ARRLEN(x), 1e-5f);
+    memcpy(_x, x, sizeof(float) * ARRLEN(x));
 
     float x_[c->n_embd];
     float v0[c->n_embd]; v0[0] = NAN;
@@ -437,8 +450,14 @@ void forward(float *logits, rwkv_config *c, rwkv_weights *w, float *model_state[
         VECADD(x, x, dx);
 
         layer_norm(x_, x, w->blocks[i].ln2_weight, w->blocks[i].ln2_bias, ARRLEN(x_), 1e-5f);
+        float s_emb_x_T[c->s_lora_r * 32];
+        if (c->de) {
+            MATxVEC(s_emb_x_T, _x, w->blocks[i].ffn_s_emb_x_weight);
+            VECADD(s_emb_x_T, s_emb_x_T, w->blocks[i].ffn_s_emb + token * c->s_lora_r * 32);
+            mat_transpose(s_emb_x_T, c->s_lora_r, 32);
+        }
         last_x_offset = IDX(i, 1, 0, 2, c->n_embd);
-        channel_mixing(dx, x_, model_state[0] + last_x_offset, w->blocks + i, c);
+        channel_mixing(dx, x_, model_state[0] + last_x_offset, s_emb_x_T, w->blocks + i, c);
         VECADD(x, x, dx);
     }
 
@@ -480,6 +499,9 @@ void load_model(const char *model_path, rwkv_config *c, rwkv_weights *w) {
         int32_t a_lora_r;
         int32_t g_lora_r;
         int32_t v_lora_r;
+        int32_t de;
+        int32_t dea;
+        int32_t s_lora_r;
     } header;
     #pragma pack(pop)
     ERR(fread(&header, sizeof(header), 1, fp) != 1, "failed to get model header");
@@ -497,7 +519,9 @@ void load_model(const char *model_path, rwkv_config *c, rwkv_weights *w) {
     c->a_lora_r     = header.a_lora_r;
     c->g_lora_r     = header.g_lora_r;
     c->v_lora_r     = header.v_lora_r;
-
+    c->de           = header.de;
+    c->dea          = header.dea;
+    c->s_lora_r     = header.s_lora_r;
     // load weights
     w->blocks = malloc(c->n_layer * sizeof(block_weights));
 
@@ -547,6 +571,12 @@ void load_model(const char *model_path, rwkv_config *c, rwkv_weights *w) {
         b->ffn_x_k                  = ptr; ptr += c->n_embd                     ;
         b->ffn_key_weight           = ptr; ptr += c->n_embd     * c->n_embd * 4 ;
         b->ffn_value_weight         = ptr; ptr += c->n_embd * 4 * c->n_embd     ;
+        if (c->de) {
+            b->ffn_s1_T             = ptr; ptr += c->n_embd     * c->s_lora_r   ;
+            b->ffn_s2_T             = ptr; ptr += c->s_lora_r   * c->n_embd * 4 ;
+            b->ffn_s0               = ptr; ptr += c->n_embd * 4                 ;
+            b->ffn_s_emb_x_weight   = ptr; ptr += c->s_lora_r * 32 * c->n_embd  ;
+        }
     }
     w->ln_out_weight                = ptr; ptr += c->n_embd                     ;
     w->ln_out_bias                  = ptr; ptr += c->n_embd                     ;
@@ -568,11 +598,35 @@ void load_model(const char *model_path, rwkv_config *c, rwkv_weights *w) {
         mat_transpose((float *)b->att_g1_T, c->n_embd, c->g_lora_r);
         mat_transpose((float *)b->att_g2_T, c->g_lora_r, c->n_embd);
     }
+
+    if (c->de) {
+        // load extra weights
+        char *extra_path = malloc(strlen(model_path) + 6 + 1);
+        sprintf(extra_path, "%s.extra", model_path);
+        int fd = open(extra_path, O_RDONLY);
+        ERR(fd == -1, "failed to open extra file");
+        struct stat sb;
+        ERR(fstat(fd, &sb) == -1, "fstat failed");
+        w->extra_size = sb.st_size;
+        w->extra_raw = mmap(NULL, w->extra_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        ERR(w->extra_raw == MAP_FAILED, "mmap failed");
+        close(fd);
+        free(extra_path);
+
+        for (int i = 0; i < c->n_layer; i++) {
+            block_weights *b = w->blocks + i;
+            mat_transpose((float *)b->ffn_s1_T, c->n_embd, c->s_lora_r);
+            mat_transpose((float *)b->ffn_s2_T, c->s_lora_r, c->n_embd * 4);
+            b->ffn_s_emb = w->extra_raw + i * c->s_lora_r * 32 * c->vocab_size;
+        }
+    }
+    else { w->extra_raw = NULL; }
 }
 
 void free_model(rwkv_weights *w) {
     free(w->blocks);
     free(w->raw);
+    if (w->extra_raw) { munmap((void *)w->extra_raw, w->extra_size); }
 }
 
 void load_tokenizer(rwkv_tokenizer *t, int vocab_size) {
@@ -710,7 +764,7 @@ int main(int argc, char *argv[]) {
 
         forward(logits, &config, &weights, model_state, next_token);
         const char *token_str = tokenizer.vocab[next_token];
-        if (strncmp(token_str, "\n\n", 2) == 0) { break; }
+        // if (strncmp(token_str, "\n\n", 2) == 0) { break; }
 
         printf("%s", token_str);
         fflush(stdout);

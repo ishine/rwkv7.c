@@ -9,6 +9,10 @@
 #include <assert.h>
 #include <math.h>
 #include <time.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "rwkv_vocab_v20230424.h"
 
@@ -41,6 +45,8 @@
 #define E_VALUE                     2.7182818284590451
 #define SQRT_E_VALUE                1.6487212707001282
 
+void mat_transpose(float *mat, int rows, int cols);
+
 typedef enum {
     LORA_NONE, LORA_TANH, LORA_SIGM
 } lora_act;
@@ -55,6 +61,9 @@ typedef struct {
     int32_t a_lora_r;
     int32_t g_lora_r;
     int32_t v_lora_r;
+    bool de;
+    bool dea;
+    int32_t s_lora_r;
 } rwkv_config;
 
 typedef struct {
@@ -91,6 +100,11 @@ typedef struct {
     const float *ffn_x_k                ;
     const float *ffn_key_weight         ;
     const float *ffn_value_weight       ;
+    const float *ffn_s1_T               ;
+    const float *ffn_s2_T               ;
+    const float *ffn_s0                 ;
+    const float *ffn_s_emb_x_weight     ;
+    const float *ffn_s_emb              ;
 } block_weights;
 
 typedef struct {
@@ -102,6 +116,9 @@ typedef struct {
     const float *ln_out_weight;
     const float *ln_out_bias;
     const float *head_weight;
+
+    const float *extra_raw;
+    size_t extra_size;
 } rwkv_weights;
 
 typedef struct {

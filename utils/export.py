@@ -6,8 +6,10 @@ import struct
 import torch
 from rwkv.model import RWKV
 
+MODEL_FORMAT_VER = 1
+
 def serialize_fp32(file, tensor):
-    d = tensor.detach().cpu().view(-1).to(torch.float32).numpy()
+    d = tensor.detach().cpu().reshape(-1).to(torch.float32).numpy()
     b = struct.pack(f'{len(d)}f', *d)
     file.write(b)
 
@@ -23,16 +25,21 @@ def export(model, export_path):
     g_lora_rank = model['blocks.0.att.g1'].size()[1]
     v_lora_rank = model['blocks.1.att.v1'].size()[1]
 
+    de = True if 'blocks.0.ffn.s_emb.weight' in model else False
+    dea = False
+    s_lora_rank = model['blocks.0.ffn.s1'].size()[1] if de is True else 0
+
     export_model = open(export_path, 'wb')
     header = struct.pack(
-        'Liiiiiiiii',
+        'Liiiiiiiiiiii',
         magic_number, quant, head_size, n_embd, n_layer, vocab_size,
-        w_lora_rank, a_lora_rank, g_lora_rank, v_lora_rank
+        w_lora_rank, a_lora_rank, g_lora_rank, v_lora_rank, 
+        de, dea, s_lora_rank
     )
     export_model.write(header)
 
     weights = [
-        model['emb.weight'],                 
+        model['emb.weight'],
 
         model['blocks.0.ln0.weight'],
         model['blocks.0.ln0.bias'],
@@ -81,6 +88,13 @@ def export(model, export_path):
             model[f'blocks.{i}.ffn.key.weight'],
             model[f'blocks.{i}.ffn.value.weight'],
         ])
+        if de is True:
+            weights.extend([
+                model[f'blocks.{i}.ffn.s1'],
+                model[f'blocks.{i}.ffn.s2'],
+                model[f'blocks.{i}.ffn.s0'],
+                model[f'blocks.{i}.ffn.s_emb_x.weight'],
+            ])
 
     weights.extend([
         model['ln_out.weight'],
@@ -93,6 +107,20 @@ def export(model, export_path):
 
     print("Model export done: ", export_path)
     export_model.close()
+
+    if de is True:
+        export_extra = open(export_path + ".extra", 'wb')
+        extra = []
+        for i in range(n_layer):
+            extra.extend([
+                model[f'blocks.{i}.ffn.s_emb.weight'],
+            ])
+
+        for w in extra:
+            serialize_fp32(export_extra, w)
+
+        print("Model export done: ", export_path + ".extra")
+        export_extra.close()
 
 if len(sys.argv) < 3:
     print('Usage: python export.py <rwkv_model> <export_model>')
