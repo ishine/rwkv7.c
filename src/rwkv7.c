@@ -666,6 +666,7 @@ void print_usage(char *argv[]) {
     fprintf(stderr, "  --presence_penalty <float>   presence penalty\n");
     fprintf(stderr, "  --frequency_penalty <float>  frequency penalty\n");
     fprintf(stderr, "  --seed <int>                 random seed\n");
+    fprintf(stderr, "  -l --max_dec_len <int>       max decoding length\n");
     exit(EXIT_FAILURE);
 }
 
@@ -676,6 +677,7 @@ int main(int argc, char *argv[]) {
     bool chat_mode = false, reasoner_mode = false;
     const char *msg = NULL;
     const char *model_path = NULL;
+    int max_dec_len = 10240;
 
     if (argc < 2) { print_usage(argv); }
     for (int i = 1; i < argc; i++) {
@@ -695,9 +697,12 @@ int main(int argc, char *argv[]) {
             { sampler.presence_penalty = atof(argv[i + 1]); i++; }
         else if (strcmp(argv[i], "--frequency_penalty") == 0)
             { sampler.frequency_penalty = atof(argv[i + 1]); i++; }
+        else if ((strcmp(argv[i], "--max_dec_len") == 0) || (strcmp(argv[i], "-l") == 0))
+            { max_dec_len = atoi(argv[i + 1]); i++; }
         else { model_path = argv[i]; }
     }
     if ((msg == NULL) || (model_path == NULL)) { print_usage(argv); }
+    if (max_dec_len                 <=  0) { max_dec_len                = 10240; }
     if (sampler.temperature         < 0.0) { sampler.temperature        = 0.0; }
     if (sampler.top_p               < 0.0) { sampler.top_p              = 0.0; }
     if (sampler.presence_penalty    < 0.0) { sampler.presence_penalty   = 0.0; }
@@ -758,7 +763,7 @@ int main(int argc, char *argv[]) {
     // decoding
     SYSTIME_MS(start);
     int decoding_tokens = 0;
-    for (decoding_tokens = 0; decoding_tokens < 10240; decoding_tokens++) {
+    for (decoding_tokens = 0; decoding_tokens < max_dec_len; decoding_tokens++) {
         int next_token = sample_logits(logits, &config, &sampler);
         if (next_token == 0) { printf("\n---Meet EOS!---\n"); break; }
 
