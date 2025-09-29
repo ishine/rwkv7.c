@@ -431,7 +431,12 @@ void channel_mixing(float *dx, const float *x, float *last_x, const float *s_emb
     memcpy(last_x, x, sizeof(float) * c->n_embd);
 }
 
-void forward(float *logits, rwkv_config *c, rwkv_weights *w, float *model_state[], int token) {
+void forward(
+    float *logits,                                      // output
+    rwkv_config *c, rwkv_weights *w,                    // model
+    float *last_x, float *wkv_state,                    // hidden states
+    int token                                           // input
+) {
     float x[c->n_embd], _x[c->n_embd];
     memcpy(x, w->emb_weight + token * c->n_embd, sizeof(float) * ARRLEN(x));
     layer_norm(x, x, w->blocks_0_ln0_weight, w->blocks_0_ln0_bias, ARRLEN(x), 1e-5f);
@@ -446,7 +451,7 @@ void forward(float *logits, rwkv_config *c, rwkv_weights *w, float *model_state[
 
         int last_x_offset = IDX(i, 0, 0, 2, c->n_embd);
         int state_offset = i * c->n_head * c->head_size * c->head_size;
-        time_mixing(dx, x_, v0, model_state[0] + last_x_offset, model_state[1] + state_offset, w->blocks + i, c);
+        time_mixing(dx, x_, v0, last_x + last_x_offset, wkv_state + state_offset, w->blocks + i, c);
         VECADD(x, x, dx);
 
         layer_norm(x_, x, w->blocks[i].ln2_weight, w->blocks[i].ln2_bias, ARRLEN(x_), 1e-5f);
@@ -457,7 +462,7 @@ void forward(float *logits, rwkv_config *c, rwkv_weights *w, float *model_state[
             mat_transpose(s_emb_x_T, c->s_lora_r, 32);
         }
         last_x_offset = IDX(i, 1, 0, 2, c->n_embd);
-        channel_mixing(dx, x_, model_state[0] + last_x_offset, s_emb_x_T, w->blocks + i, c);
+        channel_mixing(dx, x_, last_x + last_x_offset, s_emb_x_T, w->blocks + i, c);
         VECADD(x, x, dx);
     }
 
@@ -739,9 +744,9 @@ int main(int argc, char *argv[]) {
     encode(&tokenizer, context, token_list, &prefilling_tokens);
     free(context);
 
-    float *model_state[2];  // init with zero
-    model_state[0] = calloc(config.n_layer * 2 * config.n_embd, sizeof(float));
-    model_state[1] = calloc(config.n_layer * config.n_head * config.head_size * config.head_size, sizeof(float));
+    float *last_x, *wkv_state;  // init with zero
+    last_x = calloc(config.n_layer * 2 * config.n_embd, sizeof(float));
+    wkv_state = calloc(config.n_layer * config.n_head * config.head_size * config.head_size, sizeof(float));
 
     float logits[config.vocab_size];
     long start, end;
@@ -750,7 +755,7 @@ int main(int argc, char *argv[]) {
     // prefilling
     SYSTIME_MS(start);
     for (int i = 0; i < prefilling_tokens; i++) {
-        forward(logits, &config, &weights, model_state, token_list[i]);
+        forward(logits, &config, &weights, last_x, wkv_state, token_list[i]);
         if (!chat_mode) {
             const char *token_str = tokenizer.vocab[token_list[i]];
             printf("%s", token_str);
@@ -767,7 +772,7 @@ int main(int argc, char *argv[]) {
         int next_token = sample_logits(logits, &config, &sampler);
         if (next_token == 0) { printf("\n---Meet EOS!---\n"); break; }
 
-        forward(logits, &config, &weights, model_state, next_token);
+        forward(logits, &config, &weights, last_x, wkv_state, next_token);
         const char *token_str = tokenizer.vocab[next_token];
         // if (strncmp(token_str, "\n\n", 2) == 0) { break; }
 
@@ -783,8 +788,8 @@ int main(int argc, char *argv[]) {
     printf("Decode: %d tokens, %ld ms, %f token/s\n",
         decoding_tokens, decoding_time, (float)decoding_tokens / decoding_time * 1000);
 
-    free(model_state[0]);
-    free(model_state[1]);
+    free(last_x);
+    free(wkv_state);
     free_model(&weights);
     free_tokenizer(&tokenizer);
     free(sampler.occurrence);
