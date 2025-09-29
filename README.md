@@ -26,7 +26,7 @@ wget "https://huggingface.co/BlinkDL/rwkv-7-world/resolve/main/RWKV-x070-World-0
 python ./utils/export.py ./model.pth ./model.bin # pip install torch rwkv
 make # make avx/neon
 
-# default params: temperature = 1.0, top-p = 0.7, presence_penalty = 0.1, frequency_penalty = 0.2
+# default params: temperature = 1.0, top-p = 0.7, presence_penalty = 0.1, frequency_penalty = 0.2, max_dec_len = 10240
 # generate mode
 ./rwkv7 ./model.bin -i "Once upon a time," --temperature 1.3 --top-p 0.8 --presence_penalty 0.4 --frequency_penalty 0.5
 # chat mode
@@ -36,6 +36,8 @@ make # make avx/neon
 ```
 
 ## TODO
-- DeepEmbed/DeepEmbedAttention
+- DeepEmbedAttention
+- Sequential forward for prefilling
+- Performance benchmark
 - FP16 support, mainly on ARM NEON
 - Model quantization
