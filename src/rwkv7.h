@@ -20,6 +20,8 @@
 #include "simd/avx.h"
 #elif defined(NEON)
 #include "simd/neon.h"
+#elif defined(BLAS)
+#include "blas.h"
 #endif
 
 #define ERR(COND, MSG)              do { if (COND) { fprintf(stderr, "Error: %s\n", MSG); exit(EXIT_FAILURE); } } while(0)

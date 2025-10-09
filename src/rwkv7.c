@@ -1,7 +1,7 @@
 #include "rwkv7.h"    
 
 // operators
-#if !defined(AVX) && !defined(NEON)
+#if !defined(AVX) && !defined(NEON) && !defined(BLAS)
 void vec_add(float *xout, const float *a, const float *b, int len) {
     for (int i = 0; i < len; i++) { xout[i] = a[i] + b[i]; }
 }
@@ -47,6 +47,7 @@ void lerp(float *xout, const float *x, const float *last_x, const float *mu, int
 }
 #endif
 
+#ifndef BLAS
 void mat_mul_vec(float *xout, const float *x, const float *w, int x_len, int xout_len) {
     // W (d,n) @ x (n,) -> xout (d,) 
     int d = xout_len;
@@ -55,6 +56,7 @@ void mat_mul_vec(float *xout, const float *x, const float *w, int x_len, int xou
         xout[i] = vec_dot_product(w + i * n, x, n);
     }
 }
+#endif
 
 void layer_norm(float *xout, const float *x, const float *weight, const float *bias, int len, float sqrt_bias) {
     float x_mean = vec_sum(x, len) / len;
