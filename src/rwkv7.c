@@ -731,9 +731,9 @@ int main(int argc, char *argv[]) {
 
     const char *prompt_tmpl = "%s";
     if (chat_mode && !reasoner_mode)
-        { prompt_tmpl = "User: %s\n\nAssistant:"; }
+        { prompt_tmpl = "User: %s\n\nAssistant: "; }
     else if (chat_mode && reasoner_mode)
-        { prompt_tmpl = "User: %s\n\nAssistant:<think>"; }
+        { prompt_tmpl = "User: %s\n\nAssistant: <think>"; }
 
     int context_len = snprintf(NULL, 0, prompt_tmpl, msg);
     char *context = malloc(context_len + 1);
