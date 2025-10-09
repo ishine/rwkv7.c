@@ -470,6 +470,46 @@ void forward(
     mat_mul_vec(logits, x, w->head_weight, ARRLEN(x), c->vocab_size);
 }
 
+void run(
+    float *logits,                                                      // output
+    rwkv_config *c, rwkv_weights *w, rwkv_tokenizer *t, rwkv_sampler *s,// model
+    float *last_x, float *wkv_state,                                    // hidden states
+    int *token_list, int prefilling_tokens                              // input
+) {
+    long start, end;
+
+    // prefilling
+    SYSTIME_MS(start);
+    for (int i = 0; i < prefilling_tokens; i++) {
+        forward(logits, c, w, last_x, wkv_state, token_list[i]);
+        if (c->chat_mode) {
+            const char *token_str = t->vocab[token_list[i]];
+            printf("%s", token_str);
+            fflush(stdout);
+        }
+    }
+    SYSTIME_MS(end);
+    c->prefilling_time = end - start;
+    
+    // decoding
+    SYSTIME_MS(start);
+    for (c->decoding_tokens = 0; c->decoding_tokens < c->max_dec_len; c->decoding_tokens++) {
+        int next_token = sample_logits(logits, c, s);
+        if ((next_token == 0) && !c->bench_mode) { printf("\n---Meet EOS!---\n"); break; }
+
+        forward(logits, c, w, last_x, wkv_state, next_token);
+        if (!c->bench_mode) {
+            const char *token_str = t->vocab[next_token];
+            // if (strncmp(token_str, "\n\n", 2) == 0) { break; }
+
+            printf("%s", token_str);
+            fflush(stdout);
+        }
+    }
+    SYSTIME_MS(end);
+    c->decoding_time = end - start;
+}
+
 // load and free
 void mat_transpose(float *mat, int rows, int cols) {
     float *tmp = malloc(rows * cols * sizeof(float));
@@ -665,6 +705,7 @@ void print_usage(char *argv[]) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  --chat                       enable chat mode\n");
     fprintf(stderr, "  --reasoner                   enable reasoner mode\n");
+    fprintf(stderr, "  --bench                      enable benchmark mode\n");
     fprintf(stderr, "  -i, --input <input message>  model inference input\n");
     fprintf(stderr, "  --temperature <float>        sample temperature\n");
     fprintf(stderr, "  --top-p <float>              sample top-p\n");
@@ -676,20 +717,22 @@ void print_usage(char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
-
+    rwkv_config config = {.chat_mode = false, .reasoner_mode = false, .bench_mode = false, .max_dec_len = 10240};
+    rwkv_weights weights;
+    rwkv_tokenizer tokenizer;
     rwkv_sampler sampler = { .temperature = 1.0, .top_p = 0.7, .presence_penalty = 0.1, .frequency_penalty = 0.2 };
     unsigned int seed = time(NULL);
-    bool chat_mode = false, reasoner_mode = false;
     const char *msg = NULL;
     const char *model_path = NULL;
-    int max_dec_len = 10240;
 
     if (argc < 2) { print_usage(argv); }
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--chat") == 0) 
-            { chat_mode = true; }
+            { config.chat_mode = true; }
         else if (strcmp(argv[i], "--reasoner") == 0)
-            { chat_mode = true; reasoner_mode = true; }
+            { config.chat_mode = true; config.reasoner_mode = true; }
+        else if (strcmp(argv[i], "--bench") == 0)
+            { config.bench_mode = true; }
         else if ((strcmp(argv[i], "-i") == 0) || (strcmp(argv[i], "--input") == 0))
             { msg = argv[i + 1]; i++; }
         else if (strcmp(argv[i], "--temperature") == 0)
@@ -703,11 +746,15 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "--frequency_penalty") == 0)
             { sampler.frequency_penalty = atof(argv[i + 1]); i++; }
         else if ((strcmp(argv[i], "--max_dec_len") == 0) || (strcmp(argv[i], "-l") == 0))
-            { max_dec_len = atoi(argv[i + 1]); i++; }
+            { config.max_dec_len = atoi(argv[i + 1]) <= 0 ? config.max_dec_len : atoi(argv[i + 1]); i++; }
         else { model_path = argv[i]; }
     }
-    if ((msg == NULL) || (model_path == NULL)) { print_usage(argv); }
-    if (max_dec_len                 <=  0) { max_dec_len                = 10240; }
+    if (model_path == NULL) { print_usage(argv); }
+    if ((msg == NULL) && (!config.bench_mode)) { print_usage(argv); }
+    if (config.bench_mode) {
+        config.max_dec_len = 128;
+        sampler.temperature = 0.0;
+    }
     if (sampler.temperature         < 0.0) { sampler.temperature        = 0.0; }
     if (sampler.top_p               < 0.0) { sampler.top_p              = 0.0; }
     if (sampler.presence_penalty    < 0.0) { sampler.presence_penalty   = 0.0; }
@@ -715,10 +762,6 @@ int main(int argc, char *argv[]) {
     srand(seed);
 
     printf("Hello, RWKV! seed: %u\n\n", seed);
-    rwkv_config config;
-    rwkv_weights weights;
-    rwkv_tokenizer tokenizer;
-
     printf("Loading model...\n");
     load_model(model_path, &config, &weights);
     printf("Model loaded!\n\n");
@@ -729,65 +772,86 @@ int main(int argc, char *argv[]) {
 
     sampler.occurrence = calloc(config.vocab_size, sizeof(int));
 
-    const char *prompt_tmpl = "%s";
-    if (chat_mode && !reasoner_mode)
-        { prompt_tmpl = "User: %s\n\nAssistant: "; }
-    else if (chat_mode && reasoner_mode)
-        { prompt_tmpl = "User: %s\n\nAssistant: <think>"; }
-
-    int context_len = snprintf(NULL, 0, prompt_tmpl, msg);
-    char *context = malloc(context_len + 1);
-    sprintf(context, prompt_tmpl, msg);
-
-    int token_list[context_len];
+    int *token_list = NULL;
     int prefilling_tokens = 0;
-    encode(&tokenizer, context, token_list, &prefilling_tokens);
-    free(context);
+    if (!config.bench_mode) {
+        const char *prompt_tmpl = "%s";
+        if (config.chat_mode && !config.reasoner_mode)
+            { prompt_tmpl = "User: %s\n\nAssistant: "; }
+        else if (config.chat_mode && config.reasoner_mode)
+            { prompt_tmpl = "User: %s\n\nAssistant: <think>"; }
 
+        int context_len = snprintf(NULL, 0, prompt_tmpl, msg);
+        char *context = malloc(context_len + 1);
+        sprintf(context, prompt_tmpl, msg);
+        token_list = malloc(sizeof(int) * context_len);
+        encode(&tokenizer, context, token_list, &prefilling_tokens);
+        free(context);
+    }
+    else {
+        prefilling_tokens = 512;
+        token_list = malloc(sizeof(int) * prefilling_tokens);
+        for (int i = 0 ; i < prefilling_tokens; i++) {
+            // token_list[i] = (int)((double)rand() / RAND_MAX * config.vocab_size);
+            token_list[i] = rand() % config.vocab_size;
+        }
+    }
+
+    // run
+    float logits[config.vocab_size];
     float *last_x, *wkv_state;  // init with zero
     last_x = calloc(config.n_layer * 2 * config.n_embd, sizeof(float));
     wkv_state = calloc(config.n_layer * config.n_head * config.head_size * config.head_size, sizeof(float));
-
-    float logits[config.vocab_size];
-    long start, end;
-    long prefilling_time, decoding_time;
-
-    // prefilling
-    SYSTIME_MS(start);
-    for (int i = 0; i < prefilling_tokens; i++) {
-        forward(logits, &config, &weights, last_x, wkv_state, token_list[i]);
-        if (!chat_mode) {
-            const char *token_str = tokenizer.vocab[token_list[i]];
-            printf("%s", token_str);
-            fflush(stdout);
+    if (!config.bench_mode) {
+        run(
+            logits,
+            &config, &weights, &tokenizer, &sampler,
+            last_x, wkv_state,
+            token_list, prefilling_tokens
+        );
+        float prefilling_speed = (double)prefilling_tokens / config.prefilling_time * 1000;
+        float decoding_speed = (double)config.decoding_tokens / config.decoding_time * 1000;
+        printf("\n---------\n");
+        printf("Prefill: %d tokens, %ld ms, %f token/s\n",
+            prefilling_tokens, config.prefilling_time, prefilling_speed);
+        printf("Decode: %d tokens, %ld ms, %f token/s\n",
+            config.decoding_tokens, config.decoding_time, decoding_speed);
+    }
+    else {
+        printf("Start benchmark: p%dg%d\n", prefilling_tokens, config.max_dec_len);
+        int heat = 1, loop = 5;
+        float p_speed[loop], d_speed[loop];
+        for (int i = 0; i < heat + loop; i++) {
+            memset(last_x, 0, config.n_layer * 2 * config.n_embd * sizeof(float));
+            memset(wkv_state, 0, config.n_layer * config.n_head * config.head_size * config.head_size * sizeof(float));
+            run(
+                logits,
+                &config, &weights, &tokenizer, &sampler,
+                last_x, wkv_state,
+                token_list, prefilling_tokens
+            );
+            if (i >= heat) {
+                p_speed[i - heat] = (double)prefilling_tokens / config.prefilling_time * 1000;
+                d_speed[i - heat] = (double)config.decoding_tokens / config.decoding_time * 1000;
+                printf("%d: loop\n", i);
+            }
+            else { printf("%d: heat\n", i); }
         }
+        float p_speed_mean = vec_sum(p_speed, loop) / loop;
+        float d_speed_mean = vec_sum(d_speed, loop) / loop;
+        float p_speed_var = 0, d_speed_var = 0;
+        for (int i = 0; i < loop; i++) {
+            p_speed_var = MAXIMUM(p_speed_var, fabs(p_speed[i] - p_speed_mean));
+            d_speed_var = MAXIMUM(d_speed_var, fabs(d_speed[i] - d_speed_mean));
+        }
+
+        printf("\n---------\n");
+        printf("p512g128\n");
+        printf("Prefill: %f(±%f) token/s\n", p_speed_mean, p_speed_var);
+        printf("Decode: %f(±%f) token/s\n", d_speed_mean, d_speed_var);
     }
-    SYSTIME_MS(end);
-    prefilling_time = end - start;
-    
-    // decoding
-    SYSTIME_MS(start);
-    int decoding_tokens = 0;
-    for (decoding_tokens = 0; decoding_tokens < max_dec_len; decoding_tokens++) {
-        int next_token = sample_logits(logits, &config, &sampler);
-        if (next_token == 0) { printf("\n---Meet EOS!---\n"); break; }
 
-        forward(logits, &config, &weights, last_x, wkv_state, next_token);
-        const char *token_str = tokenizer.vocab[next_token];
-        // if (strncmp(token_str, "\n\n", 2) == 0) { break; }
-
-        printf("%s", token_str);
-        fflush(stdout);
-    }
-    SYSTIME_MS(end);
-    decoding_time = end - start;
-
-    printf("\n---------\n");
-    printf("Prefill: %d tokens, %ld ms, %f token/s\n",
-        prefilling_tokens, prefilling_time, (float)prefilling_tokens / prefilling_time * 1000);
-    printf("Decode: %d tokens, %ld ms, %f token/s\n",
-        decoding_tokens, decoding_time, (float)decoding_tokens / decoding_time * 1000);
-
+    free(token_list);
     free(last_x);
     free(wkv_state);
     free_model(&weights);

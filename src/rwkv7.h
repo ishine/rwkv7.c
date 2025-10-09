@@ -52,6 +52,18 @@ typedef enum {
 } lora_act;
 
 typedef struct {
+    // inference config
+    bool chat_mode;
+    bool reasoner_mode;
+    bool bench_mode;
+    int max_dec_len;
+
+    // inference info
+    long prefilling_time;
+    long decoding_time;
+    int decoding_tokens;
+
+    // model config
     int32_t head_size;
     int32_t vocab_size;
     int32_t n_embd;
