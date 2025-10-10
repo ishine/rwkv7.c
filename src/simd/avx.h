@@ -106,19 +106,25 @@ float vec_sum(const float *x, int len) {
     return ret;
 }
 
-void lerp(float *xout, const float *x, const float *last_x, const float *mu, int len) {
-    int i = 0;
-    for (; i <= len - 8; i += 8) {
-        __m256 x_vec = _mm256_loadu_ps(x + i);
-        __m256 last_x_vec = _mm256_loadu_ps(last_x + i);
-        __m256 mu_vec = _mm256_loadu_ps(mu + i);
+void lerp(float *xout, const float *a, const float *b, const float *mu, int len, int seq_len) {
+    // xout = b + mu * (a - b)
+    for (int i = 0; i < seq_len; i++) {
+        const float *_a = a + i * len;
+        const float *_b = b + i * len;
+        float *_xout = xout + i * len;
+        int j = 0;
+        for (; j <= len - 8; j += 8) {
+            __m256 a_vec = _mm256_loadu_ps(_a + j);
+            __m256 b_vec = _mm256_loadu_ps(_b + j);
+            __m256 mu_vec = _mm256_loadu_ps(mu + j);
 
-        __m256 xout_vec = _mm256_sub_ps(last_x_vec, x_vec);
-        xout_vec = _mm256_fmadd_ps(mu_vec, xout_vec, x_vec);
-        _mm256_storeu_ps(xout + i, xout_vec);
-    }
-    for (; i < len; i++) {
-        xout[i] = x[i] + mu[i] * (last_x[i] - x[i]);
+            __m256 xout_vec = _mm256_sub_ps(a_vec, b_vec);
+            xout_vec = _mm256_fmadd_ps(mu_vec, xout_vec, b_vec);
+            _mm256_storeu_ps(_xout + j, xout_vec);
+        }
+        for (; j < len; j++) {
+            _xout[j] = _b[j] + mu[j] * (_a[j] - _b[j]);
+        }
     }
 }
 

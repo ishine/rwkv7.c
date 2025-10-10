@@ -42,15 +42,27 @@ float vec_sum(const float *x, int len) {
     return ret;
 }
 
-void lerp(float *xout, const float *x, const float *last_x, const float *mu, int len) {
-    for (int i = 0; i < len; i++) {
-        xout[i] = x[i] + mu[i] * (last_x[i] - x[i]);
+void lerp(float *xout, const float *a, const float *b, const float *mu, int len, int seq_len) {
+    // xout = b + mu * (a - b)
+    for (int i = 0; i < seq_len; i++) {
+        const float *_a = a + i * len;
+        const float *_b = b + i * len;
+        float *_xout = xout + i * len;
+        for (int j = 0; j < len; j++) {
+            _xout[j] = _b[j] + mu[j] * (_a[j] - _b[j]);
+        }
     }
 }
 
-void mat_mul_vec(float *xout, const float *x, const float *w, int x_len, int xout_len) {
-    int M = xout_len, N = x_len;
-    cblas_sgemv(CblasRowMajor, CblasNoTrans, M, N, 1.0, w, N, x, 1, 0.0, xout, 1);
+void mat_mul_vec(float *xout, const float *x, const float *w, int x_len, int xout_len, int seq_len) {
+    if (seq_len == 1) {
+        int M = xout_len, N = x_len;
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, M, N, 1.0, w, N, x, 1, 0.0, xout, 1);
+    }
+    else {
+        int M = seq_len, K = x_len, N = xout_len;
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0, x, K, w, K, 0.0, xout, N);
+    }
 }
 
 #endif

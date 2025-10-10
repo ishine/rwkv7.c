@@ -103,19 +103,25 @@ float vec_sum(const float *x, int len) {
     return ret;
 }
 
-void lerp(float *xout, const float *x, const float *last_x, const float *mu, int len) {
-    int i = 0;
-    for (; i <= len - 4; i += 4) {
-        float32x4_t x_vec = vld1q_f32(x + i);
-        float32x4_t last_x_vec = vld1q_f32(last_x + i);
-        float32x4_t mu_vec = vld1q_f32(mu + i);
+void lerp(float *xout, const float *a, const float *b, const float *mu, int len, int seq_len) {
+    // xout = b + mu * (a - b)
+    for (int i = 0; i < seq_len; i++) {
+        const float *_a = a + i * len;
+        const float *_b = b + i * len;
+        float *_xout = xout + i * len;
+        int j = 0;
+        for (; j <= len - 4; j += 4) {
+            float32x4_t a_vec = vld1q_f32(_a + j);
+            float32x4_t b_vec = vld1q_f32(_b + j);
+            float32x4_t mu_vec = vld1q_f32(mu + j);
 
-        float32x4_t xout_vec = vsubq_f32(last_x_vec, x_vec);
-        xout_vec = vfmaq_f32(x_vec, mu_vec, xout_vec);
-        vst1q_f32(xout + i, xout_vec);
-    }
-    for (; i < len; i++) {
-        xout[i] = x[i] + mu[i] * (last_x[i] - x[i]);
+            float32x4_t xout_vec = vsubq_f32(a_vec, b_vec);
+            xout_vec = vfmaq_f32(b_vec, mu_vec, xout_vec);
+            vst1q_f32(_xout + j, xout_vec);
+        }
+        for (; j < len; j++) {
+            _xout[j] = _b[j] + mu[j] * (_a[j] - _b[j]);
+        }
     }
 }
 

@@ -30,19 +30,24 @@
 #define IDX(I, J, K, DIM2, DIM3)    ((I) * (DIM2) * (DIM3) + (J) * (DIM3) + (K))
 #define SQUARE(X)                   ((X) * (X))
 #define MAXIMUM(A, B)               ((A > B) ? A : B)
+#define MINIMUM(A, B)               ((A < B) ? A : B)
 #define RELU(X)                     MAXIMUM(X, 0)
 #define IS_NAN(X)                   (!((X) == (X)))
 
-#define MATxVEC(XOUT, X, W)         mat_mul_vec(XOUT, X, W, ARRLEN(X), ARRLEN(XOUT))
 #define VECADD(XOUT, A, B)          vec_add(XOUT, A, B, ARRLEN(XOUT))
 #define VECSUB(XOUT, A, B)          vec_sub(XOUT, A, B, ARRLEN(XOUT))
 #define HADAMARD(XOUT, A, B)        vec_hadamard(XOUT, A, B, ARRLEN(XOUT))
 #define VECBIAS(XOUT, A, B)         vec_bias(XOUT, A, B, ARRLEN(XOUT))
 #define VECSCALE(XOUT, A, B)        vec_scale(XOUT, A, B, ARRLEN(XOUT))
-#define LERP(XOUT, X, LAST_X, MU)   lerp(XOUT, X, LAST_X, MU, ARRLEN(XOUT))
 
-#define VECTANH(XOUT)               do { for (int i = 0; i < ARRLEN(XOUT); i++) { XOUT[i] = tanh(XOUT[i]); } } while(0)
-#define VECSIGM(XOUT)               do { for (int i = 0; i < ARRLEN(XOUT); i++) { XOUT[i] = 1.0 / (1.0 + exp(-XOUT[i])); } } while(0)
+#define VECTANH(XOUT, LEN)          do { for (int i = 0; i < (LEN); i++) { XOUT[i] = tanh(XOUT[i]); } } while(0)
+#define VECSIGM(XOUT, LEN)          do { for (int i = 0; i < (LEN); i++) { XOUT[i] = 1.0 / (1.0 + exp(-XOUT[i])); } } while(0)
+
+#define VECADD_SEQ(XOUT, A, B, LEN, SEQ_LEN) do { \
+    for (int i = 0; i < (SEQ_LEN); i++) { vec_add((XOUT) + i * (LEN), A + i * (LEN), B, (LEN)); } } while(0)
+
+#define HADAMARD_SEQ(XOUT, A, B, LEN, SEQ_LEN) do { \
+    for (int i = 0; i < (SEQ_LEN); i++) { vec_hadamard((XOUT) + i * (LEN), A + i * (LEN), B, (LEN)); } } while(0)
 
 #define E_VALUE                     2.7182818284590451
 #define SQRT_E_VALUE                1.6487212707001282
@@ -59,6 +64,8 @@ typedef struct {
     bool reasoner_mode;
     bool bench_mode;
     int max_dec_len;
+    int chunk_size;
+    bool seq_full_output;
 
     // inference info
     long prefilling_time;

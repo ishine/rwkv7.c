@@ -40,34 +40,49 @@ float vec_sum(const float *x, int len) {
     return ret;
 }
 
-void lerp(float *xout, const float *x, const float *last_x, const float *mu, int len) {
-    for (int i = 0; i < len; i++) {
-        xout[i] = x[i] + mu[i] * (last_x[i] - x[i]);
+void lerp(float *xout, const float *a, const float *b, const float *mu, int len, int seq_len) {
+    // xout = b + mu * (a - b)
+    for (int i = 0; i < seq_len; i++) {
+        const float *_a = a + i * len;
+        const float *_b = b + i * len;
+        float *_xout = xout + i * len;
+        for (int j = 0; j < len; j++) {
+            _xout[j] = _b[j] + mu[j] * (_a[j] - _b[j]);
+        }
     }
 }
 #endif
 
 #ifndef BLAS
-void mat_mul_vec(float *xout, const float *x, const float *w, int x_len, int xout_len) {
+void mat_mul_vec(float *xout, const float *x, const float *w, int x_len, int xout_len, int seq_len) {
     // W (d,n) @ x (n,) -> xout (d,) 
     int d = xout_len;
     int n = x_len;
-    for (int i = 0; i < d; i++) {
-        xout[i] = vec_dot_product(w + i * n, x, n);
+    for (int i = 0; i < seq_len; i++) {
+        const float *_x = x + i * n;
+        float *_xout = xout + i * d;
+        for (int j = 0; j < d; j++) {
+            _xout[j] = vec_dot_product(w + j * n, _x, n);
+        }
     }
 }
 #endif
 
-void layer_norm(float *xout, const float *x, const float *weight, const float *bias, int len, float sqrt_bias) {
-    float x_mean = vec_sum(x, len) / len;
+void layer_norm(float *xout, const float *x, const float *weight, const float *bias, int len, int seq_len, float eps) {
+    // actually group_norm now
+    for (int i = 0; i < seq_len; i++) {
+        const float *_x = x + i * len;
+        float *_xout = xout + i * len;
+        float x_mean = vec_sum(_x, len) / len;
 
-    float x_centered[len];
-    VECBIAS(x_centered, x, -x_mean);
-    float x_var = vec_dot_product(x_centered, x_centered, len) / len;
+        float x_centered[len];
+        VECBIAS(x_centered, _x, -x_mean);
+        float x_var = vec_dot_product(x_centered, x_centered, len) / len;
 
-    vec_scale(xout, x_centered, 1.0f/sqrt(x_var + sqrt_bias), len);
-    vec_hadamard(xout, xout, weight, len);
-    vec_add(xout, xout, bias, len);
+        vec_scale(_xout, x_centered, 1.0f/sqrt(x_var + eps), len);
+        vec_hadamard(_xout, _xout, weight, len);
+        vec_add(_xout, _xout, bias, len);
+    }
 }
 
 void softmax(float *xout, const float *x, float temp, int len) {
@@ -83,16 +98,16 @@ void softmax(float *xout, const float *x, float temp, int len) {
     for (int i = 0; i < len; i++) { xout[i] /= sum; }
 }
 
-void lora(float *xout, const float *x, const float *weight_1, const float *weight_2, int x_len, int lora_rank, lora_act func) {
-    float tmp[lora_rank];
-    mat_mul_vec(tmp, x, weight_1, x_len, lora_rank);
+void lora(float *xout, const float *x, const float *weight_1, const float *weight_2, int x_len, int lora_rank, int seq_len, lora_act func) {
+    float tmp[lora_rank * seq_len];
+    mat_mul_vec(tmp, x, weight_1, x_len, lora_rank, seq_len);
     switch (func) {
         case LORA_NONE: break;
-        case LORA_TANH: VECTANH(tmp); break;
-        case LORA_SIGM: VECSIGM(tmp); break;
+        case LORA_TANH: VECTANH(tmp, lora_rank * seq_len); break;
+        case LORA_SIGM: VECSIGM(tmp, lora_rank * seq_len); break;
         default: ERR(1, "unknown lora activation function");
     }
-    mat_mul_vec(xout, tmp, weight_2, lora_rank, x_len);
+    mat_mul_vec(xout, tmp, weight_2, lora_rank, x_len, seq_len);
 }
 
 // utils for tokenizer
@@ -265,74 +280,13 @@ int sample_logits(float* logits, rwkv_config *c, rwkv_sampler *s) {
 }
 
 // RWKV block
-void time_mixing(float *dx, const float *x, float *v0, float *last_x, float *state, block_weights *bw, rwkv_config *c) {
-    float xr[c->n_embd], xw[c->n_embd], xk[c->n_embd], xv[c->n_embd], xa[c->n_embd], xg[c->n_embd];
-    LERP(xr, x, last_x, bw->att_x_r);
-    LERP(xw, x, last_x, bw->att_x_w);
-    LERP(xk, x, last_x, bw->att_x_k);
-    LERP(xv, x, last_x, bw->att_x_v);
-    LERP(xa, x, last_x, bw->att_x_a);
-    LERP(xg, x, last_x, bw->att_x_g);
-
-    // r = Wr @ xr
-    float r[c->n_embd];
-    MATxVEC(r, xr, bw->att_receptance_weight);
-
-    // w = np.exp(-sigmoid(np.tanh(xw @ Ww1) @ Ww2 + w_bias)/np.e**0.5)
-    float w[c->n_embd];
-    do {
-        float w_sigmoid_[c->n_embd];
-        lora(w_sigmoid_, xw, bw->att_w1_T, bw->att_w2_T, ARRLEN(xw), c->w_lora_r, LORA_TANH);   // np.tanh(xw @ Ww1) @ Ww2
-        VECADD(w_sigmoid_, w_sigmoid_, bw->att_w0);                                             // np.tanh(xw @ Ww1) @ Ww2 + w_bias
-        VECSIGM(w_sigmoid_);                                                                    // sigmoid(...)
-        for (int i = 0; i < c->n_embd; i++) { w[i] = exp(-w_sigmoid_[i] / SQRT_E_VALUE); }      // exp(...)
-    } while(0); // w = np.exp(-sigmoid(np.tanh(xw @ Ww1) @ Ww2 + w_bias)/np.e**0.5)
-
-    // k = Wk @ xk
-    float k[c->n_embd];
-    MATxVEC(k, xk, bw->att_key_weight);
-
-    // v = Wv @ xv
-    float v[c->n_embd];
-    MATxVEC(v, xv, bw->att_value_weight);
-
-    if (IS_NAN(v0[0])) {
-        memcpy(v0, v, sizeof(float) * c->n_embd);
-    }
-    else {
-        // v += (v0 - v) * sigmoid(xv @ Wv1 @ Wv2 + v_bias)
-        float v_sigmoid_[c->n_embd];
-        lora(v_sigmoid_, xv, bw->att_v1_T, bw->att_v2_T, ARRLEN(xv), c->v_lora_r, LORA_NONE);   // xv @ Wv1 @ Wv2
-        VECADD(v_sigmoid_, v_sigmoid_, bw->att_v0);                                             // xv @ Wv1 @ Wv2 + v_bias
-        VECSIGM(v_sigmoid_);                                                                    // sigmoid(...)
-        LERP(v, v, v0, v_sigmoid_);                                                             // (v0 - v) * sigmoid(...)
-    }
-
-    // a = sigmoid(xa @ Wa1 @ Wa2 + a_bias)
-    float a[c->n_embd];
-    lora(a, xa, bw->att_a1_T, bw->att_a2_T, ARRLEN(xa), c->a_lora_r, LORA_NONE);    // xa @ Wa1 @ Wa2
-    VECADD(a, a, bw->att_a0);                                                       // xa @ Wa1 @ Wa2 + a_bias
-    VECSIGM(a);                                                                     // sigmoid(...)
-
-    // g = sigmoid(xg @ Wg1) @ Wg2
-    float g[c->n_embd];
-    lora(g, xg, bw->att_g1_T, bw->att_g2_T, ARRLEN(xg), c->g_lora_r, LORA_SIGM);
-
-    // kk = k * k_k
-    float kk[c->n_embd];
-    HADAMARD(kk, k, bw->att_k_k);
-
-    // k += k * (a-1) * k_a
-    do {
-        float ones[c->n_embd];
-        for (int i = 0; i < c->n_embd; i++) { ones[i] = 1.0f; }
-        float k_lerp[c->n_embd];
-        LERP(k_lerp, ones, a, bw->att_k_a);
-        HADAMARD(k, k, k_lerp);
-    } while(0);
-
+void wkv_kernel(
+    float *y,
+    block_weights *bw, rwkv_config *c,
+    float *state,
+    const float *r, const float *w, const float *k, const float *v, float *kk, const float *a
+) {
     // multi-head
-    float y[c->n_head * c->head_size];
     for (int i = 0; i < c->n_head; i++) {
         float *head_state   = state + i * c->head_size * c->head_size;
         float *head_kk      = kk    + i * c->head_size;
@@ -360,7 +314,7 @@ void time_mixing(float *dx, const float *x, float *v0, float *last_x, float *sta
         // - S = S * w.mT - S @ kk * (kk * a).mT + v * k.mT
         do {
             float state_mul_kk[c->head_size];
-            mat_mul_vec(state_mul_kk, head_kk, head_state, c->head_size, c->head_size); // S @ kk
+            mat_mul_vec(state_mul_kk, head_kk, head_state, c->head_size, c->head_size, 1); // S @ kk
 
             float kk_mul_a[c->head_size];
             HADAMARD(kk_mul_a, head_kk, head_a);                                        // kk * a
@@ -381,10 +335,10 @@ void time_mixing(float *dx, const float *x, float *v0, float *last_x, float *sta
         } while(0); // S = S * w.mT - S @ kk * (kk * a).mT + v * k.mT
 
         // y = S @ r
-        mat_mul_vec(head_y, head_r, head_state, c->head_size, c->head_size);
+        mat_mul_vec(head_y, head_r, head_state, c->head_size, c->head_size, 1);
 
         // y = group_norm(y, ln_w, ln_b)
-        layer_norm(head_y, head_y, ln_w, ln_b, c->head_size, 64e-5f);
+        layer_norm(head_y, head_y, ln_w, ln_b, c->head_size, 1, 64e-5f);
 
         // y += ((r * k * r_k).sum(axis=1,keepdims=1) * v).flatten()
         do {
@@ -397,79 +351,184 @@ void time_mixing(float *dx, const float *x, float *v0, float *last_x, float *sta
         } while(0); // y += ((r * k * r_k).sum(axis=1,keepdims=1) * v).flatten()
     }   // multi-head
 
+}
+
+void time_mixing(float *dx, const float *x, float *v0, float *last_x, float *state, block_weights *bw, rwkv_config *c, int seq_len) {
+    float x_shift[c->n_embd * seq_len];
+    memcpy(x_shift, last_x, sizeof(float) * c->n_embd);
+    memcpy(x_shift + c->n_embd, x, sizeof(float) * c->n_embd * (seq_len - 1));
+
+    float x_lerp[c->n_embd * seq_len];
+    float *wkv_input = malloc(sizeof(float) * c->n_embd * seq_len * 6); // r, w, k, v, kk, a
+
+    // r = Wr @ xr
+    float *r = wkv_input + 0 * c->n_embd * seq_len;
+    lerp(x_lerp, x_shift, x, bw->att_x_r, c->n_embd, seq_len);
+    mat_mul_vec(r, x_lerp, bw->att_receptance_weight, c->n_embd, c->n_embd, seq_len);
+
+    // w = np.exp(-sigmoid(np.tanh(xw @ Ww1) @ Ww2 + w_bias)/np.e**0.5)
+    float *w = wkv_input + 1 * c->n_embd * seq_len;
+    lerp(x_lerp, x_shift, x, bw->att_x_w, c->n_embd, seq_len);
+    do {
+        float w_sigmoid_[c->n_embd * seq_len];
+        lora(w_sigmoid_, x_lerp, bw->att_w1_T, bw->att_w2_T, c->n_embd, c->w_lora_r, seq_len, LORA_TANH);   // np.tanh(xw @ Ww1) @ Ww2
+        VECADD_SEQ(w_sigmoid_, w_sigmoid_, bw->att_w0, c->n_embd, seq_len);                                 // np.tanh(xw @ Ww1) @ Ww2 + w_bias
+        VECSIGM(w_sigmoid_, c->n_embd * seq_len);                                                           // sigmoid(...)
+        for (int i = 0; i < c->n_embd * seq_len; i++) { w[i] = exp(-w_sigmoid_[i] / SQRT_E_VALUE); }        // exp(...)
+    } while(0); // w = np.exp(-sigmoid(np.tanh(xw @ Ww1) @ Ww2 + w_bias)/np.e**0.5)
+
+    // k = Wk @ xk
+    float *k = wkv_input + 2 * c->n_embd * seq_len;
+    lerp(x_lerp, x_shift, x, bw->att_x_k, c->n_embd, seq_len);
+    mat_mul_vec(k, x_lerp, bw->att_key_weight, c->n_embd, c->n_embd, seq_len);
+
+    // v = Wv @ xv
+    float *v = wkv_input + 3 * c->n_embd * seq_len;
+    lerp(x_lerp, x_shift, x, bw->att_x_v, c->n_embd, seq_len);
+    mat_mul_vec(v, x_lerp, bw->att_value_weight, c->n_embd, c->n_embd, seq_len);
+
+    if (IS_NAN(v0[0])) {
+        memcpy(v0, v, sizeof(float) * c->n_embd * seq_len);
+    }
+    else {
+        // v += (v0 - v) * sigmoid(xv @ Wv1 @ Wv2 + v_bias)
+        float v_sigmoid_[c->n_embd * seq_len];
+        lora(v_sigmoid_, x_lerp, bw->att_v1_T, bw->att_v2_T, c->n_embd, c->v_lora_r, seq_len, LORA_NONE);   // xv @ Wv1 @ Wv2
+        VECADD_SEQ(v_sigmoid_, v_sigmoid_, bw->att_v0, c->n_embd, seq_len);                                 // xv @ Wv1 @ Wv2 + v_bias
+        VECSIGM(v_sigmoid_, c->n_embd * seq_len);                                                           // sigmoid(...)
+        lerp(v, v0, v, v_sigmoid_, c->n_embd * seq_len, 1);                                                 // (v0 - v) * sigmoid(...)
+    }
+
+    // kk = k * k_k
+    float *kk = wkv_input + 5 * c->n_embd * seq_len;
+    HADAMARD_SEQ(kk, k, bw->att_k_k, c->n_embd, seq_len);
+
+    // a = sigmoid(xa @ Wa1 @ Wa2 + a_bias)
+    float *a = wkv_input + 4 * c->n_embd * seq_len;
+    lerp(x_lerp, x_shift, x, bw->att_x_a, c->n_embd, seq_len);
+    lora(a, x_lerp, bw->att_a1_T, bw->att_a2_T, c->n_embd, c->a_lora_r, seq_len, LORA_NONE);    // xa @ Wa1 @ Wa2
+    VECADD_SEQ(a, a, bw->att_a0, c->n_embd, seq_len);                                           // xa @ Wa1 @ Wa2 + a_bias
+    VECSIGM(a, c->n_embd * seq_len);                                                            // sigmoid(...)
+
+    // g = sigmoid(xg @ Wg1) @ Wg2
+    float g[c->n_embd * seq_len];
+    lerp(x_lerp, x_shift, x, bw->att_x_g, c->n_embd, seq_len);
+    lora(g, x_lerp, bw->att_g1_T, bw->att_g2_T, c->n_embd, c->g_lora_r, seq_len, LORA_SIGM);
+    
+    // k = k * lerp(a, 1, k_a)
+    // -> k += k * (a-1) * k_a
+    do {
+        float a_minus_1[c->n_embd * seq_len];
+        VECBIAS(a_minus_1, a, -1.0f);
+        HADAMARD_SEQ(a_minus_1, a_minus_1, bw->att_k_a, c->n_embd, seq_len);
+        HADAMARD(a_minus_1, k, a_minus_1);
+        vec_add(k, k, a_minus_1, c->n_embd * seq_len);
+    } while(0);
+
+    // wkv kernel
+    float y[c->n_embd * seq_len];
+    for (int i = 0; i < seq_len; i++) {
+        float *_y = y + i * c->n_embd;
+        float *_r = r + i * c->n_embd;
+        float *_w = w + i * c->n_embd;
+        float *_k = k + i * c->n_embd;
+        float *_v = v + i * c->n_embd;
+        float *_kk = kk + i * c->n_embd;
+        float *_a = a + i * c->n_embd;
+        wkv_kernel(_y, bw, c, state, _r, _w, _k, _v, _kk, _a);
+    }
+    free(wkv_input);
+
     // dx = Wo @ (y * g)
     do {
-        float y_mul_g[c->n_embd];
-        HADAMARD(y_mul_g, y, g);
-        mat_mul_vec(dx, y_mul_g, bw->att_output_weight, ARRLEN(y_mul_g), c->n_embd);
+        HADAMARD(y, y, g);
+        mat_mul_vec(dx, y, bw->att_output_weight, c->n_embd, c->n_embd, seq_len);
     } while(0); // dx = Wo @ (y * g)
 
     // last_x = x
-    memcpy(last_x, x, sizeof(float) * c->n_embd);
+    memcpy(last_x, x + (seq_len - 1) * c->n_embd, sizeof(float) * c->n_embd);
 }
 
-void channel_mixing(float *dx, const float *x, float *last_x, const float *s_emb_x_T, block_weights *bw, rwkv_config *c) {
-    float k[c->n_embd * 4];
-    float xk[c->n_embd];
-    LERP(xk, x, last_x, bw->ffn_x_k);
+void channel_mixing(float *dx, const float *x, float *last_x, const float *s_emb_x_T, block_weights *bw, rwkv_config *c, int seq_len) {
+    float k[c->n_embd * 4 * seq_len];
+    float x_shift[c->n_embd * seq_len];
+    memcpy(x_shift, last_x, sizeof(float) * c->n_embd);
+    memcpy(x_shift + c->n_embd, x, sizeof(float) * c->n_embd * (seq_len - 1));
+    float xk[c->n_embd * seq_len];
+    lerp(xk, x_shift, x, bw->ffn_x_k, c->n_embd, seq_len);
 
-    MATxVEC(k, xk, bw->ffn_key_weight);
+    mat_mul_vec(k, xk, bw->ffn_key_weight, c->n_embd, c->n_embd * 4, seq_len);
     for (int i = 0; i < ARRLEN(k); i++) { k[i] = SQUARE(RELU(k[i])); }
     
     if (c->de) {
-        float s[c->n_embd * 4];
-        float ss[c->s_lora_r], ss_[c->s_lora_r];
-        mat_mul_vec(ss, x, bw->ffn_s1_T, c->n_embd, c->s_lora_r);
-        MATxVEC(ss_, ss, s_emb_x_T);
-        MATxVEC(s, ss_, bw->ffn_s2_T);
-        VECADD(s, s, bw->ffn_s0);
+        float s[c->n_embd * 4 * seq_len];
+        float ss[c->s_lora_r * seq_len], ss_[c->s_lora_r * seq_len];
+        mat_mul_vec(ss, x, bw->ffn_s1_T, c->n_embd, c->s_lora_r, seq_len);
+        for (int i = 0; i < seq_len; i++) {
+            mat_mul_vec(
+                ss_ + i * c->s_lora_r, 
+                ss + i * c->s_lora_r, 
+                s_emb_x_T + i * c->s_lora_r * 32,
+                c->s_lora_r, 32, 1
+            );
+        }
+        mat_mul_vec(s, ss_, bw->ffn_s2_T, c->s_lora_r, c->n_embd * 4, seq_len);
+        VECADD_SEQ(s, s, bw->ffn_s0, c->n_embd, seq_len);
         HADAMARD(k, k, s);
     }
 
-    float v[c->n_embd];
-    MATxVEC(v, k, bw->ffn_value_weight);
+    float *v = dx;
+    mat_mul_vec(v, k, bw->ffn_value_weight, c->n_embd * 4, c->n_embd, seq_len);
     
-    memcpy(dx, v, sizeof(float) * c->n_embd);
-    memcpy(last_x, x, sizeof(float) * c->n_embd);
+    memcpy(last_x, x + (seq_len - 1) * c->n_embd, sizeof(float) * c->n_embd);
 }
 
 void forward(
-    float *logits,                                      // output
-    rwkv_config *c, rwkv_weights *w,                    // model
-    float *last_x, float *wkv_state,                    // hidden states
-    int token                                           // input
+    float *logits,                      // output
+    rwkv_config *c, rwkv_weights *w,    // model
+    float *last_x, float *wkv_state,    // hidden states
+    int *token_list, int seq_len        // input
 ) {
-    float x[c->n_embd], _x[c->n_embd];
-    memcpy(x, w->emb_weight + token * c->n_embd, sizeof(float) * ARRLEN(x));
-    layer_norm(x, x, w->blocks_0_ln0_weight, w->blocks_0_ln0_bias, ARRLEN(x), 1e-5f);
+    float x[c->n_embd * seq_len], _x[c->n_embd * seq_len];
+    for (int i = 0; i < seq_len; i++) {
+        memcpy(x + i * c->n_embd, w->emb_weight + token_list[i] * c->n_embd, sizeof(float) * c->n_embd);
+    }
     memcpy(_x, x, sizeof(float) * ARRLEN(x));
 
-    float x_[c->n_embd];
-    float v0[c->n_embd]; v0[0] = NAN;
-    float dx[c->n_embd];
+    float x_[c->n_embd * seq_len];
+    float v0[c->n_embd * seq_len]; v0[0] = NAN;
+    float dx[c->n_embd * seq_len];
 
     for (int i = 0; i < c->n_layer; i++) {
-        layer_norm(x_, x, w->blocks[i].ln1_weight, w->blocks[i].ln1_bias, ARRLEN(x_), 1e-5f);
+        layer_norm(x_, x, w->blocks[i].ln1_weight, w->blocks[i].ln1_bias, c->n_embd, seq_len, 1e-5f);
 
         int last_x_offset = IDX(i, 0, 0, 2, c->n_embd);
         int state_offset = i * c->n_head * c->head_size * c->head_size;
-        time_mixing(dx, x_, v0, last_x + last_x_offset, wkv_state + state_offset, w->blocks + i, c);
+        time_mixing(dx, x_, v0, last_x + last_x_offset, wkv_state + state_offset, w->blocks + i, c, seq_len);
         VECADD(x, x, dx);
 
-        layer_norm(x_, x, w->blocks[i].ln2_weight, w->blocks[i].ln2_bias, ARRLEN(x_), 1e-5f);
-        float s_emb_x_T[c->s_lora_r * 32];
+        layer_norm(x_, x, w->blocks[i].ln2_weight, w->blocks[i].ln2_bias, c->n_embd, seq_len, 1e-5f);
+        float s_emb_x_T[c->s_lora_r * 32 * seq_len];
         if (c->de) {
-            MATxVEC(s_emb_x_T, _x, w->blocks[i].ffn_s_emb_x_weight);
-            VECADD(s_emb_x_T, s_emb_x_T, w->blocks[i].ffn_s_emb + token * c->s_lora_r * 32);
-            mat_transpose(s_emb_x_T, c->s_lora_r, 32);
+            mat_mul_vec(s_emb_x_T, _x, w->blocks[i].ffn_s_emb_x_weight, c->n_embd, c->s_lora_r * 32, seq_len);
+            for (int j = 0; j < seq_len; j++) {
+                float *_s_emb_x_T = s_emb_x_T + j * c->s_lora_r * 32;
+                vec_add(_s_emb_x_T, _s_emb_x_T, w->blocks[i].ffn_s_emb + token_list[j] * c->s_lora_r * 32, c->s_lora_r * 32);
+                mat_transpose(_s_emb_x_T, c->s_lora_r, 32);
+            }
         }
         last_x_offset = IDX(i, 1, 0, 2, c->n_embd);
-        channel_mixing(dx, x_, last_x + last_x_offset, s_emb_x_T, w->blocks + i, c);
+        channel_mixing(dx, x_, last_x + last_x_offset, s_emb_x_T, w->blocks + i, c, seq_len);
         VECADD(x, x, dx);
     }
 
-    layer_norm(x, x, w->ln_out_weight, w->ln_out_bias, ARRLEN(x), 1e-5f);
-    mat_mul_vec(logits, x, w->head_weight, ARRLEN(x), c->vocab_size);
+    if (!c->seq_full_output) {
+        memcpy(x, x + (seq_len - 1) * c->n_embd, sizeof(float) * c->n_embd);
+        seq_len = 1;
+    }
+    layer_norm(x, x, w->ln_out_weight, w->ln_out_bias, c->n_embd, seq_len, 1e-5f);
+    mat_mul_vec(logits, x, w->head_weight, c->n_embd, c->vocab_size, seq_len);
+
 }
 
 void run(
@@ -482,24 +541,27 @@ void run(
 
     // prefilling
     SYSTIME_MS(start);
-    for (int i = 0; i < prefilling_tokens; i++) {
-        forward(logits, c, w, last_x, wkv_state, token_list[i]);
-        if (c->chat_mode) {
+    for (int i = 0; i < prefilling_tokens; i += c->chunk_size) {
+        int this_chunk_size = MINIMUM(c->chunk_size, prefilling_tokens - i);
+        forward(logits, c, w, last_x, wkv_state, token_list + i, this_chunk_size);
+    }
+    SYSTIME_MS(end);
+    c->prefilling_time = end - start;
+    if (c->chat_mode) {
+        for (int i = 0; i < prefilling_tokens; i++) {
             const char *token_str = t->vocab[token_list[i]];
             printf("%s", token_str);
             fflush(stdout);
         }
     }
-    SYSTIME_MS(end);
-    c->prefilling_time = end - start;
-    
+
     // decoding
     SYSTIME_MS(start);
     for (c->decoding_tokens = 0; c->decoding_tokens < c->max_dec_len; c->decoding_tokens++) {
         int next_token = sample_logits(logits, c, s);
         if ((next_token == 0) && !c->bench_mode) { printf("\n---Meet EOS!---\n"); break; }
 
-        forward(logits, c, w, last_x, wkv_state, next_token);
+        forward(logits, c, w, last_x, wkv_state, &next_token, 1);
         if (!c->bench_mode) {
             const char *token_str = t->vocab[next_token];
             // if (strncmp(token_str, "\n\n", 2) == 0) { break; }
@@ -631,6 +693,9 @@ void load_model(const char *model_path, rwkv_config *c, rwkv_weights *w) {
 
     ERR((ptr - w->raw) * sizeof(float) != raw_weights_size, "failed to map model weights");
 
+    // merge ln0 into emb
+    layer_norm((float *)w->emb_weight, w->emb_weight, w->blocks_0_ln0_weight, w->blocks_0_ln0_bias, c->n_embd, c->vocab_size, 1e-5f);
+
     // transpose all lora weight matrices
     for (int i = 0; i < c->n_layer; i++) {
         block_weights *b = w->blocks + i;
@@ -715,11 +780,15 @@ void print_usage(char *argv[]) {
     fprintf(stderr, "  --frequency_penalty <float>  frequency penalty\n");
     fprintf(stderr, "  --seed <int>                 random seed\n");
     fprintf(stderr, "  -l --max_dec_len <int>       max decoding length\n");
+    fprintf(stderr, "  --chunk_size <int>           chunk size for prefilling (default: 64)\n");
     exit(EXIT_FAILURE);
 }
 
 int main(int argc, char *argv[]) {
-    rwkv_config config = {.chat_mode = false, .reasoner_mode = false, .bench_mode = false, .max_dec_len = 10240};
+    rwkv_config config = {
+        .chat_mode = false, .reasoner_mode = false, .bench_mode = false,
+        .max_dec_len = 10240, .chunk_size = 64, .seq_full_output = false
+    };
     rwkv_weights weights;
     rwkv_tokenizer tokenizer;
     rwkv_sampler sampler = { .temperature = 1.0, .top_p = 0.7, .presence_penalty = 0.1, .frequency_penalty = 0.2 };
@@ -749,6 +818,8 @@ int main(int argc, char *argv[]) {
             { sampler.frequency_penalty = atof(argv[i + 1]); i++; }
         else if ((strcmp(argv[i], "--max_dec_len") == 0) || (strcmp(argv[i], "-l") == 0))
             { config.max_dec_len = atoi(argv[i + 1]) <= 0 ? config.max_dec_len : atoi(argv[i + 1]); i++; }
+        else if (strcmp(argv[i], "--chunk_size") == 0)
+            { config.chunk_size = atoi(argv[i + 1]) <= 0 ? 1 : atoi(argv[i + 1]); i++; }
         else { model_path = argv[i]; }
     }
     if (model_path == NULL) { print_usage(argv); }
