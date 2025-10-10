@@ -848,7 +848,7 @@ int main(int argc, char *argv[]) {
         }
 
         printf("\n---------\n");
-        printf("p512g128\n");
+        printf("p%dg%d\n", prefilling_tokens, config.max_dec_len);
         printf("Prefill: %f(±%f) token/s\n", p_speed_mean, p_speed_var);
         printf("Decode: %f(±%f) token/s\n", d_speed_mean, d_speed_var);
     }
