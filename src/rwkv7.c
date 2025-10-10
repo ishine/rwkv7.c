@@ -473,7 +473,7 @@ void channel_mixing(float *dx, const float *x, float *last_x, const float *s_emb
             );
         }
         mat_mul_vec(s, ss_, bw->ffn_s2_T, c->s_lora_r, c->n_embd * 4, seq_len);
-        VECADD_SEQ(s, s, bw->ffn_s0, c->n_embd, seq_len);
+        VECADD_SEQ(s, s, bw->ffn_s0, c->n_embd * 4, seq_len);
         HADAMARD(k, k, s);
     }
 
