@@ -42,23 +42,25 @@ python ./utils/export.py ./model.pth ./model.bin # pip install torch rwkv
 # reasoner mode (rwkv7-g1)
 ./rwkv7 ./model-g1.bin --reasoner -i "What is RWKV?" # use default params
 # benchmark mode
-./rwkv7 ./model.bin --bench
+./rwkv7 ./model.bin --bench # try to decrease chunk_size if stack overflow
 
 ```
 
 ## TODO
 - DeepEmbedAttention
-- Sequential forward for prefilling
 - FP16 support, mainly on ARM NEON
 - Model quantization
 
 ## Benchmark
-model: 0.1B
+model: 0.1B, p512g128, chunk_size=64
 | Platform                      | Backend                               | Prefill t/s   | Decode t/s    |
 | ------------------------------|---------------------------------------|---------------|---------------|
-| **AMD R5-4600H, DDR4-3200**   | -                                     | 8.85 ±0.26    | 8.49 ±0.09    |
-|                               | `avx`                                 | 37.15 ±0.11   | 30.17 ±0.10   |
-|                               | openblas 0.3.26, `OMP_NUM_THREADS=1`  | 38.64 ±0.09   | 31.73 ±0.14   |
-| **Rockchip RK3588, LPDDR4x**  | -                                     | 7.96 ±0.04    | 7.42 ±0.06    |
-|                               | `neon`                                | 27.80 ±0.00   | 22.25 ±0.01   |
-|                               | openblas 0.3.26, `OMP_NUM_THREADS=1`  | 28.91 ±0.04   | 22.83 ±0.04   |
+| **AMD R5-4600H, DDR4-3200**   | -                                     | 12.91 ±0.01   | 8.07 ±0.00    |
+|                               | `avx`                                 | 60.39 ±0.12   | 28.29 ±0.06   |
+|                               | openblas 0.3.26, `OMP_NUM_THREADS=1`  | 310.53 ±1.16  | 30.49 ±0.17   |
+| **Intel i9-9820X, DDR4-2133** | -                                     | 11.53 ±0.02   | 7.03 ±0.01    |
+|                               | `avx`                                 | 69.66 ±0.05   | 23.84 ±0.01   |
+|                               | openblas 0.3.26, `OMP_NUM_THREADS=1`  | 355.67 ±2.81  | 22.99 ±0.02   |
+| **Rockchip RK3588, LPDDR4x**  | -                                     | 12.15 ±0.02   | 7.41 ±0.01    |
+|                               | `neon`                                | 44.38 ±0.02   | 22.54 ±0.02   |
+|                               | openblas 0.3.26, `OMP_NUM_THREADS=1`  | 128.03 ±0.80  | 21.97 ±0.82   |
